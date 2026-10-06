@@ -126,7 +126,7 @@ function todayISO() {
   return `${y}-${m}-${day}`;
 }
 
-// Latin-safe string for pdf-lib standard fonts (strip non-WinAnsi)
+// Latin-safe string for pdf-lib standard fonts
 function sanitizeForPdf(str) {
   if (str == null) return '';
   return String(str).replace(/[^\x00-\xFF]/g, '?');
@@ -156,6 +156,7 @@ const MTLogo = () => {
 
 // ---------- Main App ----------
 function App() {
+  // Language (already persisted via useEffect below)
   const [language, setLanguage] = useState(() => {
     const saved = localStorage.getItem('app_language');
     return saved === 'bn' ? 'bn' : 'en';
@@ -190,6 +191,14 @@ function App() {
       return {};
     }
   });
+
+  // Search / filter
+  const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all'); // 'all' | 'missing' | 'ok' | 'blocking'
+
+  // Drag-from-list state
+  const [draggedFileId, setDraggedFileId] = useState(null);
+  const [dragOverReqId, setDragOverReqId] = useState(null);
 
   // Generation state
   const [generating, setGenerating] = useState(false);
@@ -487,9 +496,18 @@ function App() {
   };
 
   const handleClearAll = async () => {
+    const confirmed = window.confirm(
+      language === 'bn'
+        ? 'আপনি কি নিশ্চিত? সব আপলোড করা ফাইল, ম্যাচ এবং মেয়াদ মুছে যাবে।'
+        : 'Are you sure? All uploaded files, matches, and expiry dates will be removed.'
+    );
+    if (!confirmed) return;
     setPdfMeta([]);
     setMatches({});
     setExpiries({});
+    setGeneratedPdfUrl(null);
+    setGeneratedCsvUrl(null);
+    setGeneratedFileName('');
     try {
       await idbClear();
     } catch (e) {
@@ -528,6 +546,61 @@ function App() {
 
   const handleExpiryChange = (reqId, value) => {
     setExpiries((prev) => ({ ...prev, [reqId]: value }));
+  };
+
+  // Drag & drop from file list to requirement row
+  const handleFileDragStart = (e, fileId) => {
+    setDraggedFileId(fileId);
+    try {
+      e.dataTransfer.setData('text/plain', fileId);
+      e.dataTransfer.effectAllowed = 'move';
+    } catch (_) {}
+  };
+
+  const handleReqDragOver = (e, reqId) => {
+    if (!draggedFileId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOverReqId(reqId);
+  };
+
+  const handleReqDragLeave = (e, reqId) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOverReqId((prev) => (prev === reqId ? null : prev));
+  };
+
+  const handleReqDrop = (e, reqId) => {
+    e.preventDefault();
+    e.stopPropagation();
+    let fileId = draggedFileId;
+    try {
+      const dtId = e.dataTransfer.getData('text/plain');
+      if (dtId) fileId = dtId;
+    } catch (_) {}
+    setDragOverReqId(null);
+    setDraggedFileId(null);
+    if (!fileId) return;
+    const file = pdfMeta.find((f) => f.id === fileId);
+    if (!file) return;
+    if (!isFileUsable(file)) return;
+    // one file -> one requirement: remove any existing assignment
+    const matchedElsewhere = Object.entries(matches).find(
+      ([k, v]) => v === fileId && k !== reqId
+    );
+    if (matchedElsewhere) {
+      // replace: remove from old requirement
+      setMatches((prev) => {
+        const next = { ...prev };
+        for (const k of Object.keys(next)) {
+          if (next[k] === fileId) delete next[k];
+        }
+        next[reqId] = fileId;
+        return next;
+      });
+    } else {
+      handleMatchChange(reqId, fileId);
+    }
   };
 
   const matchedFileIds = useMemo(() => {
@@ -590,6 +663,39 @@ function App() {
 
   const canGenerate = blockingReasons.length === 0 && !generating;
 
+  // Progress metrics
+  const totalReqs = sortedRequirements.length;
+  const okCount = useMemo(
+    () =>
+      sortedRequirements.filter((r) => requirementStatuses[r.id]?.key === 'ok').length,
+    [sortedRequirements, requirementStatuses]
+  );
+  const blockingCount = blockingReasons.length;
+  const progressPercent = totalReqs > 0 ? Math.round((okCount / totalReqs) * 100) : 0;
+
+  // Filtered requirements for display
+  const filteredRequirements = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return sortedRequirements.filter((req) => {
+      const st = requirementStatuses[req.id] || { key: 'notProvided', blocking: false };
+
+      // Filter by status
+      if (statusFilter === 'missing' && st.key !== 'missing' && st.key !== 'expired')
+        return false;
+      if (statusFilter === 'ok' && st.key !== 'ok') return false;
+      if (statusFilter === 'blocking' && !st.blocking) return false;
+
+      // Search by title (both languages)
+      if (q) {
+        const en = (req.title_en || '').toLowerCase();
+        const bn = (req.title_bn || '').toLowerCase();
+        const id = (req.id || '').toLowerCase();
+        if (!en.includes(q) && !bn.includes(q) && !id.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [sortedRequirements, requirementStatuses, searchQuery, statusFilter]);
+
   // ---------- Translations ----------
   const t = {
     pdfSectionTitle: language === 'bn' ? 'পিডিএফ ডকুমেন্ট' : 'PDF Documents',
@@ -633,6 +739,20 @@ function App() {
     downloadPdf: language === 'bn' ? 'পিডিএফ ডাউনলোড করুন' : 'Download PDF',
     downloadCsv: language === 'bn' ? 'CSV ডাউনলোড করুন' : 'Download CSV',
     generationFailed: language === 'bn' ? 'জেনারেশন ব্যর্থ হয়েছে' : 'Generation failed',
+
+    searchPlaceholder: language === 'bn' ? 'শিরোনাম বা আইডি দিয়ে খুঁজুন...' : 'Search by title or ID...',
+    filterAll: language === 'bn' ? 'সব' : 'All',
+    filterMissing: language === 'bn' ? 'অনুপস্থিত' : 'Missing',
+    filterOk: language === 'bn' ? 'ঠিক আছে' : 'OK',
+    filterBlocking: language === 'bn' ? 'ব্লকিং' : 'Blocking Only',
+    noMatches: language === 'bn' ? 'কোনো শর্ত মেলেনি' : 'No requirements match your filters',
+
+    progressReady: language === 'bn' ? 'প্যাকেজ প্রস্তুত' : 'Package Ready',
+    documentsOk: language === 'bn' ? 'ডকুমেন্ট ঠিক আছে' : 'documents OK',
+    blockingIssues: language === 'bn' ? 'ব্লকিং সমস্যা' : 'blocking issues',
+    noBlockingIssues: language === 'bn' ? 'কোনো ব্লকিং সমস্যা নেই' : 'No blocking issues',
+
+    dragHint: language === 'bn' ? 'ড্র্যাগ করে ম্যাচ করুন' : 'Drag onto row to match',
   };
 
   const statusDisplay = (key) => {
@@ -668,7 +788,7 @@ function App() {
     try {
       const { tender } = tenderData;
 
-      // Collect OK requirements with files (skip duplicates/non-OK)
+      // Collect OK requirements with files
       const okItems = [];
       for (const req of sortedRequirements) {
         const st = requirementStatuses[req.id];
@@ -702,7 +822,7 @@ function App() {
       const fontRegular = await finalPdf.embedFont(StandardFonts.Helvetica);
       const fontBold = await finalPdf.embedFont(StandardFonts.HelveticaBold);
 
-      const pageWidth = 595.28; // A4
+      const pageWidth = 595.28;
       const pageHeight = 841.89;
       const margin = 50;
 
@@ -730,7 +850,6 @@ function App() {
       const cover = finalPdf.addPage([pageWidth, pageHeight]);
       let coverY = pageHeight - margin;
 
-      // Logo
       if (logoImage) {
         const logoDim = logoImage.scale(0.5);
         const maxLogoW = 100;
@@ -758,12 +877,6 @@ function App() {
         coverY -= 20;
       }
 
-      // Title
-      const coverTitle =
-        language === 'bn'
-          ? 'Tender Submission Package / টেন্ডার জমা প্যাকেজ'
-          : 'Tender Submission Package / টেন্ডার জমা প্যাকেজ';
-      // Draw title in two lines for reliability
       cover.drawText(sanitizeForPdf('Tender Submission Package'), {
         x: margin,
         y: coverY,
@@ -781,7 +894,6 @@ function App() {
       });
       coverY -= 40;
 
-      // Divider
       cover.drawLine({
         start: { x: margin, y: coverY },
         end: { x: pageWidth - margin, y: coverY },
@@ -790,7 +902,6 @@ function App() {
       });
       coverY -= 30;
 
-      // Details
       const labelEn = (en, bn) => (language === 'bn' ? bn : en);
 
       const addField = (label, value) => {
@@ -802,7 +913,6 @@ function App() {
           color: rgb(0.35, 0.35, 0.35),
         });
         coverY -= 16;
-        // Wrap value
         const maxWidth = pageWidth - margin * 2;
         const valStr = sanitizeForPdf(value);
         const words = valStr.split(' ');
@@ -838,131 +948,4 @@ function App() {
         language === 'bn' && tender.title_bn ? tender.title_bn : tender.title
       );
       addField(
-        labelEn('Procuring Entity', 'ক্রয়কারী প্রতিষ্ঠান'),
-        language === 'bn' && tender.procuring_entity_bn
-          ? tender.procuring_entity_bn
-          : tender.procuring_entity
-      );
-      addField(
-        labelEn('Bidder', 'নিবেদনকারী'),
-        language === 'bn' && tender.bidder_bn ? tender.bidder_bn : tender.bidder
-      );
-      addField(
-        labelEn('Submission Deadline', 'জমা দেওয়ার শেষ তারিখ'),
-        formatDate(tender.submission_deadline)
-      );
-
-      const genTs = new Date().toLocaleString(language === 'bn' ? 'bn-BD' : 'en-GB');
-      addField(labelEn('Generated At', 'জেনারেট করা হয়েছে'), genTs);
-
-      // ---------- CHECKLIST PAGE ----------
-      const checklist = finalPdf.addPage([pageWidth, pageHeight]);
-      let y = pageHeight - margin;
-
-      checklist.drawText(sanitizeForPdf('Verification Checklist / যাচাই চেকলিস্ট'), {
-        x: margin,
-        y,
-        size: 18,
-        font: fontBold,
-        color: rgb(0.1, 0.2, 0.5),
-      });
-      y -= 30;
-
-      // Column setup
-      const cols = [
-        { key: 'order', label: 'Order', width: 40 },
-        { key: 'id', label: 'Req ID', width: 70 },
-        { key: 'title', label: 'Title', width: 140 },
-        { key: 'mand', label: 'Mand.', width: 45 },
-        { key: 'exp', label: 'Expiry?', width: 50 },
-        { key: 'file', label: 'File', width: 110 },
-        { key: 'expDate', label: 'Expiry Date', width: 60 },
-        { key: 'status', label: 'Status', width: 60 },
-      ];
-      // Adjust widths to fit pageWidth - 2*margin
-      const totalW = cols.reduce((s, c) => s + c.width, 0);
-      const avail = pageWidth - margin * 2;
-      const scale = avail / totalW;
-      cols.forEach((c) => (c.width = c.width * scale));
-
-      const rowHeight = 22;
-
-      const drawTableHeader = () => {
-        let x = margin;
-        checklist.drawRectangle({
-          x: margin,
-          y: y - rowHeight,
-          width: avail,
-          height: rowHeight,
-          color: rgb(0.9, 0.93, 0.97),
-        });
-        cols.forEach((c) => {
-          checklist.drawText(sanitizeForPdf(c.label), {
-            x: x + 4,
-            y: y - rowHeight + 7,
-            size: 9,
-            font: fontBold,
-            color: rgb(0.15, 0.2, 0.35),
-          });
-          x += c.width;
-        });
-        y -= rowHeight;
-      };
-
-      drawTableHeader();
-
-      const statusColor = (key) => {
-        switch (key) {
-          case 'ok':
-            return rgb(0.1, 0.5, 0.2);
-          case 'expired':
-          case 'missing':
-            return rgb(0.7, 0.1, 0.1);
-          case 'expiryNeeded':
-            return rgb(0.8, 0.45, 0.0);
-          default:
-            return rgb(0.4, 0.4, 0.4);
-        }
-      };
-
-      const statusLabelShort = (key) => {
-        switch (key) {
-          case 'ok':
-            return 'OK';
-          case 'expired':
-            return language === 'bn' ? 'মেয়াদোত্তীর্ণ' : 'Expired';
-          case 'missing':
-            return language === 'bn' ? 'অনুপস্থিত' : 'Missing';
-          case 'expiryNeeded':
-            return language === 'bn' ? 'মেয়াদ প্রয়োজন' : 'Expiry needed';
-          case 'notProvided':
-            return language === 'bn' ? 'প্রদান করা হয়নি' : 'Not provided';
-          default:
-            return key;
-        }
-      };
-
-      let okCount = 0;
-
-      for (const req of sortedRequirements) {
-        if (y - rowHeight < margin + 40) {
-          // new page
-          const p = finalPdf.addPage([pageWidth, pageHeight]);
-          y = pageHeight - margin;
-          // re-draw header on new page
-          // Note: we need to reassign drawing to new page
-          // Simpler: draw using `p`
-          let xh = margin;
-          p.drawRectangle({
-            x: margin,
-            y: y - rowHeight,
-            width: avail,
-            height: rowHeight,
-            color: rgb(0.9, 0.93, 0.97),
-          });
-          cols.forEach((c) => {
-            p.drawText(sanitizeForPdf(c.label), {
-              x: xh + 4,
-              y: y - rowHeight + 7,
-              size: 9,
-              font:
+        labelEn
