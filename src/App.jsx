@@ -156,7 +156,6 @@ const MTLogo = () => {
 
 // ---------- Main App ----------
 function App() {
-  // Language (already persisted via useEffect below)
   const [language, setLanguage] = useState(() => {
     const saved = localStorage.getItem('app_language');
     return saved === 'bn' ? 'bn' : 'en';
@@ -194,7 +193,7 @@ function App() {
 
   // Search / filter
   const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState('all'); // 'all' | 'missing' | 'ok' | 'blocking'
+  const [statusFilter, setStatusFilter] = useState('all');
 
   // Drag-from-list state
   const [draggedFileId, setDraggedFileId] = useState(null);
@@ -584,12 +583,10 @@ function App() {
     const file = pdfMeta.find((f) => f.id === fileId);
     if (!file) return;
     if (!isFileUsable(file)) return;
-    // one file -> one requirement: remove any existing assignment
     const matchedElsewhere = Object.entries(matches).find(
       ([k, v]) => v === fileId && k !== reqId
     );
     if (matchedElsewhere) {
-      // replace: remove from old requirement
       setMatches((prev) => {
         const next = { ...prev };
         for (const k of Object.keys(next)) {
@@ -679,13 +676,11 @@ function App() {
     return sortedRequirements.filter((req) => {
       const st = requirementStatuses[req.id] || { key: 'notProvided', blocking: false };
 
-      // Filter by status
       if (statusFilter === 'missing' && st.key !== 'missing' && st.key !== 'expired')
         return false;
       if (statusFilter === 'ok' && st.key !== 'ok') return false;
       if (statusFilter === 'blocking' && !st.blocking) return false;
 
-      // Search by title (both languages)
       if (q) {
         const en = (req.title_en || '').toLowerCase();
         const bn = (req.title_bn || '').toLowerCase();
@@ -948,4 +943,11 @@ function App() {
         language === 'bn' && tender.title_bn ? tender.title_bn : tender.title
       );
       addField(
-        labelEn
+        labelEn('Procuring Entity', 'ক্রয়কারী প্রতিষ্ঠান'),
+        language === 'bn' && tender.procuring_entity_bn
+          ? tender.procuring_entity_bn
+          : tender.procuring_entity
+      );
+      addField(
+        labelEn('Bidder', 'নিবেদনকারী'),
+        language === 'bn' && tender.bidder_bn ? tender.bid
