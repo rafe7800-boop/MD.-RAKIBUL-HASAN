@@ -1,6 +1,109 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import * as pdfjsLib from 'pdfjs-dist';
 
-// MT Logo component - tries to load company_logo.png, falls back to a simple circle
+// Configure PDF.js worker
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+// Constants
+const MAX_FILES = 30;
+const MAX_TOTAL_SIZE = 50 * 1024 * 1024; // 50 MB
+
+// ---------- IndexedDB helpers for persisting File blobs ----------
+const DB_NAME = 'mt_tender_db';
+const DB_VERSION = 1;
+const STORE_NAME = 'pdf_files';
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbPut(record) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbGetAll() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbDelete(id) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbClear() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// ---------- Utilities ----------
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+async function sha256Hex(arrayBuffer) {
+  try {
+    if (window.crypto && window.crypto.subtle) {
+      const hash = await window.crypto.subtle.digest('SHA-256', arrayBuffer);
+      return Array.from(new Uint8Array(hash))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+  } catch (e) {
+    // fall through to simple hash
+  }
+  // Simple fallback hash (FNV-1a) if SubtleCrypto unavailable
+  const bytes = new Uint8Array(arrayBuffer);
+  let h = 2166136261;
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= bytes[i];
+    h = Math.imul(h, 16777619);
+  }
+  return 'fnv_' + (h >>> 0).toString(16);
+}
+
+const isPdfFile = (file) => {
+  const nameOk = file.name.toLowerCase().endsWith('.pdf');
+  const mimeOk = file.type === 'application/pdf';
+  // Some browsers omit type for .pdf; accept if extension matches
+  return nameOk && (mimeOk || file.type === '' || file.type === 'application/octet-stream');
+};
+
+// ---------- MT Logo ----------
 const MTLogo = () => {
   const [logoError, setLogoError] = useState(false);
 
@@ -22,7 +125,7 @@ const MTLogo = () => {
   );
 };
 
-// Main App component
+// ---------- Main App ----------
 function App() {
   // Language state - initialize from localStorage or default to 'en'
   const [language, setLanguage] = useState(() => {
@@ -35,12 +138,28 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Persist language choice to localStorage whenever it changes
+  // PDF upload state: array of { id, name, size, pages, hash, duplicateOf }
+  const [pdfMeta, setPdfMeta] = useState([]);
+  const [uploadError, setUploadError] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef(null);
+
+  // Persist language choice
   useEffect(() => {
     localStorage.setItem('app_language', language);
   }, [language]);
 
-  // Load requirements.json on mount
+  // Persist PDF metadata to localStorage (metadata only)
+  useEffect(() => {
+    try {
+      localStorage.setItem('pdf_meta', JSON.stringify(pdfMeta));
+    } catch (e) {
+      console.warn('Failed to save pdf_meta:', e);
+    }
+  }, [pdfMeta]);
+
+  // Load tender data
   useEffect(() => {
     const loadData = async () => {
       try {
@@ -50,12 +169,9 @@ function App() {
           throw new Error(`Failed to load requirements.json: ${response.status}`);
         }
         const data = await response.json();
-
-        // Validate basic structure
         if (!data.tender || !Array.isArray(data.requirements)) {
           throw new Error('Invalid data format: missing tender or requirements array');
         }
-
         setTenderData(data);
         setError(null);
       } catch (err) {
@@ -65,22 +181,80 @@ function App() {
         setLoading(false);
       }
     };
-
     loadData();
   }, []);
 
-  // Toggle language between 'en' and 'bn'
+  // Restore PDF files (blobs) from IndexedDB on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const records = await idbGetAll();
+        if (cancelled) return;
+        if (records && records.length > 0) {
+          // Rebuild meta from stored records
+          const restored = records
+            .sort((a, b) => (a.uploadedAt || 0) - (b.uploadedAt || 0))
+            .map((r) => ({
+              id: r.id,
+              name: r.name,
+              size: r.size,
+              pages: r.pages,
+              hash: r.hash,
+              duplicateOf: null, // recalculated below
+              error: r.error || null,
+            }));
+          setPdfMeta(restored);
+        }
+      } catch (e) {
+        console.warn('Failed to restore PDFs from IndexedDB:', e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Recalculate duplicate status whenever pdfMeta changes
+  useEffect(() => {
+    setPdfMeta((prev) => {
+      // Build map of hash -> first occurrence index
+      const hashFirst = new Map();
+      const next = prev.map((item) => ({ ...item }));
+      next.forEach((item, idx) => {
+        if (!item.hash) {
+          item.duplicateOf = null;
+          return;
+        }
+        if (!hashFirst.has(item.hash)) {
+          hashFirst.set(item.hash, idx);
+          item.duplicateOf = null;
+        } else {
+          const firstIdx = hashFirst.get(item.hash);
+          item.duplicateOf = next[firstIdx].name;
+        }
+      });
+      // Avoid infinite loop: only update if something changed
+      const changed = prev.some(
+        (p, i) =>
+          (p.duplicateOf || null) !== (next[i].duplicateOf || null)
+      );
+      return changed ? next : prev;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pdfMeta.length]);
+
+  // Toggle language
   const toggleLanguage = () => {
     setLanguage((prev) => (prev === 'en' ? 'bn' : 'en'));
   };
 
-  // Sorted requirements by order (ascending)
+  // Sorted requirements
   const sortedRequirements = useMemo(() => {
     if (!tenderData?.requirements) return [];
     return [...tenderData.requirements].sort((a, b) => (a.order || 0) - (b.order || 0));
   }, [tenderData]);
 
-  // Helper to get title based on current language
   const getTitle = (item) => {
     if (language === 'bn') {
       return item.title_bn || item.title_en || '—';
@@ -88,7 +262,6 @@ function App() {
     return item.title_en || item.title_bn || '—';
   };
 
-  // Format date for display
   const formatDate = (dateStr) => {
     if (!dateStr) return '—';
     try {
@@ -104,7 +277,167 @@ function App() {
     }
   };
 
-  // Loading state
+  // ---------- PDF Upload Logic ----------
+  const processFiles = useCallback(
+    async (fileList) => {
+      setUploadError(null);
+      const incoming = Array.from(fileList || []);
+      if (incoming.length === 0) return;
+
+      // Validate count
+      if (pdfMeta.length + incoming.length > MAX_FILES) {
+        setUploadError(
+          language === 'bn'
+            ? `সর্বোচ্চ ${MAX_FILES}টি ফাইল আপলোড করা যাবে। বর্তমানে ${pdfMeta.length}টি আছে।`
+            : `Maximum ${MAX_FILES} files allowed. You already have ${pdfMeta.length}.`
+        );
+        return;
+      }
+
+      // Validate total size
+      const currentSize = pdfMeta.reduce((sum, f) => sum + (f.size || 0), 0);
+      const incomingSize = incoming.reduce((sum, f) => sum + f.size, 0);
+      if (currentSize + incomingSize > MAX_TOTAL_SIZE) {
+        setUploadError(
+          language === 'bn'
+            ? `মোট ${formatBytes(MAX_TOTAL_SIZE)} এর বেশি আপলোড করা যাবে না।`
+            : `Total upload size cannot exceed ${formatBytes(MAX_TOTAL_SIZE)}.`
+        );
+        return;
+      }
+
+      setUploading(true);
+      const newItems = [];
+
+      for (const file of incoming) {
+        // PDF validation
+        if (!isPdfFile(file)) {
+          const msg =
+            language === 'bn'
+              ? `শুধুমাত্র পিডিএফ অনুমোদিত: ${file.name}`
+              : `Only PDF allowed: ${file.name}`;
+          setUploadError(msg);
+          continue;
+        }
+
+        const id =
+          Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 9);
+
+        let pages = null;
+        let readError = null;
+        let hash = null;
+        let arrayBuffer = null;
+
+        try {
+          arrayBuffer = await file.arrayBuffer();
+
+          // Compute hash for duplicate detection
+          hash = await sha256Hex(arrayBuffer.slice(0));
+
+          // Count pages with pdfjs
+          // Clone the buffer because pdfjs may detach it
+          const pdfData = new Uint8Array(arrayBuffer.slice(0));
+          const pdf = await pdfjsLib.getDocument({ data: pdfData }).promise;
+          pages = pdf.numPages;
+          try {
+            pdf.destroy();
+          } catch (_) {}
+        } catch (err) {
+          console.error('PDF read error:', err);
+          readError =
+            language === 'bn'
+              ? `ফাইল পড়া যায়নি: ক্ষতিগ্রস্ত বা সুরক্ষিত - ${file.name}`
+              : `Cannot read file: damaged or protected - ${file.name}`;
+        }
+
+        const item = {
+          id,
+          name: file.name,
+          size: file.size,
+          pages,
+          hash,
+          duplicateOf: null,
+          error: readError,
+          uploadedAt: Date.now(),
+        };
+
+        // Store File blob in IndexedDB for persistence
+        try {
+          await idbPut({
+            id,
+            name: file.name,
+            size: file.size,
+            pages,
+            hash,
+            error: readError,
+            uploadedAt: item.uploadedAt,
+            blob: file,
+          });
+        } catch (e) {
+          console.warn('Failed to persist file to IndexedDB:', e);
+        }
+
+        newItems.push(item);
+      }
+
+      if (newItems.length > 0) {
+        setPdfMeta((prev) => [...prev, ...newItems]);
+      }
+      setUploading(false);
+    },
+    [pdfMeta, language]
+  );
+
+  const handleFileInput = (e) => {
+    const files = e.target.files;
+    if (files && files.length > 0) {
+      processFiles(files);
+    }
+    // reset input so same file can be re-selected
+    e.target.value = '';
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    const files = e.dataTransfer?.files;
+    if (files && files.length > 0) {
+      processFiles(files);
+    }
+  };
+
+  const handleRemove = async (id) => {
+    setPdfMeta((prev) => prev.filter((f) => f.id !== id));
+    try {
+      await idbDelete(id);
+    } catch (e) {
+      console.warn('Failed to delete from IndexedDB:', e);
+    }
+  };
+
+  const handleClearAll = async () => {
+    setPdfMeta([]);
+    try {
+      await idbClear();
+    } catch (e) {
+      console.warn('Failed to clear IndexedDB:', e);
+    }
+  };
+
+  // ---------- Loading / Error states ----------
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-100 flex items-center justify-center">
@@ -113,7 +446,6 @@ function App() {
     );
   }
 
-  // Error state
   if (error) {
     return (
       <div className="min-h-screen bg-gray-100 flex items-center justify-center p-4">
@@ -132,6 +464,27 @@ function App() {
 
   const { tender } = tenderData;
 
+  // ---------- Translations for PDF section ----------
+  const t = {
+    pdfSectionTitle: language === 'bn' ? 'পিডিএফ ডকুমেন্ট' : 'PDF Documents',
+    pdfSectionSubtitle:
+      language === 'bn'
+        ? `সর্বোচ্চ ${MAX_FILES}টি ফাইল, মোট ${formatBytes(MAX_TOTAL_SIZE)}`
+        : `Max ${MAX_FILES} files, total ${formatBytes(MAX_TOTAL_SIZE)}`,
+    uploadBtn: language === 'bn' ? 'পিডিএফ আপলোড করুন' : 'Upload PDFs',
+    dragDrop: language === 'bn' ? 'এখানে ড্র্যাগ ও ড্রপ করুন' : 'Drag & drop files here',
+    orClick: language === 'bn' ? 'অথবা ক্লিক করুন' : 'or click to browse',
+    uploading: language === 'bn' ? 'আপলোড হচ্ছে...' : 'Uploading...',
+    uploadedFiles: language === 'bn' ? 'আপলোড করা ফাইল' : 'Uploaded Files',
+    noFiles: language === 'bn' ? 'এখনো কোনো ফাইল আপলোড হয়নি' : 'No files uploaded yet',
+    clearAll: language === 'bn' ? 'সব মুছুন' : 'Clear All',
+    pages: language === 'bn' ? 'পৃষ্ঠা' : 'pages',
+    remove: language === 'bn' ? 'মুছুন' : 'Remove',
+    duplicate: language === 'bn' ? 'ডুপ্লিকেট' : 'Duplicate',
+    duplicateOf: language === 'bn' ? 'এর ডুপ্লিকেট:' : 'Duplicate of',
+    damaged: language === 'bn' ? 'ক্ষতিগ্রস্ত' : 'Damaged',
+  };
+
   return (
     <div className="min-h-screen bg-gray-100">
       {/* Header */}
@@ -149,7 +502,6 @@ function App() {
             </div>
           </div>
 
-          {/* Language Toggle */}
           <button
             onClick={toggleLanguage}
             className="px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold text-lg transition-colors shadow-sm"
@@ -215,8 +567,7 @@ function App() {
               {language === 'bn' ? 'শর্তাবলী' : 'Requirements'}
             </h3>
             <span className="bg-gray-200 text-gray-700 text-sm font-semibold px-3 py-1 rounded-full">
-              {sortedRequirements.length}{' '}
-              {language === 'bn' ? 'টি' : 'items'}
+              {sortedRequirements.length} {language === 'bn' ? 'টি' : 'items'}
             </span>
           </div>
 
@@ -232,21 +583,18 @@ function App() {
                   className="bg-white rounded-xl shadow-md p-5 hover:shadow-lg transition-shadow border-l-4 border-transparent hover:border-blue-400"
                 >
                   <div className="flex flex-col sm:flex-row sm:items-start gap-3">
-                    {/* Order Badge */}
                     <div className="flex-shrink-0">
                       <div className="w-10 h-10 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-lg">
                         {req.order}
                       </div>
                     </div>
 
-                    {/* Content */}
                     <div className="flex-1 min-w-0">
                       <h4 className="text-xl font-semibold text-gray-900 mb-3">
                         {getTitle(req)}
                       </h4>
 
                       <div className="flex flex-wrap gap-2">
-                        {/* Mandatory Badge */}
                         <span
                           className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-semibold ${
                             req.mandatory
@@ -268,7 +616,6 @@ function App() {
                             : 'Optional'}
                         </span>
 
-                        {/* Expiry Badge */}
                         <span
                           className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-semibold ${
                             req.has_expiry
@@ -292,7 +639,6 @@ function App() {
                       </div>
                     </div>
 
-                    {/* ID */}
                     <div className="flex-shrink-0 self-start">
                       <span className="text-xs text-gray-400 font-mono bg-gray-50 px-2 py-1 rounded">
                         {req.id}
@@ -301,6 +647,154 @@ function App() {
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+        </section>
+
+        {/* ---------- PDF Upload Section ---------- */}
+        <section className="mt-10">
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+            <div>
+              <h3 className="text-2xl font-bold text-gray-800">{t.pdfSectionTitle}</h3>
+              <p className="text-sm text-gray-500">{t.pdfSectionSubtitle}</p>
+            </div>
+            {pdfMeta.length > 0 && (
+              <button
+                onClick={handleClearAll}
+                className="px-4 py-2 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold text-sm transition-colors"
+              >
+                {t.clearAll}
+              </button>
+            )}
+          </div>
+
+          {/* Upload Error */}
+          {uploadError && (
+            <div className="mb-4 bg-red-50 border-l-4 border-red-500 rounded-lg p-4 flex items-start gap-3">
+              <span className="text-red-500 text-xl">⚠️</span>
+              <p className="text-red-700 font-medium flex-1">{uploadError}</p>
+              <button
+                onClick={() => setUploadError(null)}
+                className="text-red-500 hover:text-red-700 font-bold"
+                aria-label="Dismiss"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          {/* Drop Zone */}
+          <div
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            onClick={() => fileInputRef.current?.click()}
+            className={`bg-white rounded-xl border-2 border-dashed p-8 text-center cursor-pointer transition-all ${
+              isDragging
+                ? 'border-blue-500 bg-blue-50 shadow-lg'
+                : 'border-gray-300 hover:border-blue-400 hover:bg-gray-50'
+            }`}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/pdf,.pdf"
+              multiple
+              onChange={handleFileInput}
+              className="hidden"
+            />
+
+            <div className="text-5xl mb-3">📄</div>
+            <p className="text-lg font-semibold text-gray-700 mb-1">{t.dragDrop}</p>
+            <p className="text-sm text-gray-500 mb-4">{t.orClick}</p>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                fileInputRef.current?.click();
+              }}
+              disabled={uploading}
+              className="px-6 py-3 rounded-lg bg-blue-600 hover:bg-blue-700 active:bg-blue-800 disabled:bg-blue-300 text-white font-bold text-lg transition-colors shadow-sm"
+            >
+              {uploading ? t.uploading : `${t.uploadBtn} / ${language === 'bn' ? 'Upload PDFs' : 'পিডিএফ আপলোড করুন'}`}
+            </button>
+          </div>
+
+          {/* Uploaded Files List */}
+          {pdfMeta.length > 0 && (
+            <div className="mt-6">
+              <h4 className="text-lg font-bold text-gray-800 mb-3">
+                {t.uploadedFiles} ({pdfMeta.length}/{MAX_FILES})
+              </h4>
+              <div className="space-y-3">
+                {pdfMeta.map((f) => {
+                  const isDup = !!f.duplicateOf;
+                  const hasError = !!f.error;
+                  return (
+                    <div
+                      key={f.id}
+                      className={`bg-white rounded-xl shadow-sm p-4 border-l-4 ${
+                        hasError
+                          ? 'border-red-500'
+                          : isDup
+                          ? 'border-yellow-400'
+                          : 'border-green-500'
+                      }`}
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+                        <div className="flex-shrink-0 text-2xl">📄</div>
+
+                        <div className="flex-1 min-w-0">
+                          <p
+                            className="text-lg font-semibold text-gray-900 truncate"
+                            title={f.name}
+                          >
+                            {f.name}
+                          </p>
+                          <div className="flex flex-wrap gap-3 mt-1 text-sm text-gray-600">
+                            <span>{formatBytes(f.size)}</span>
+                            {f.pages != null && (
+                              <span>
+                                {f.pages} {t.pages}
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Duplicate badge */}
+                          {isDup && (
+                            <div className="mt-2 inline-flex items-center gap-2 px-3 py-1 rounded-full bg-yellow-100 text-yellow-800 text-sm font-semibold">
+                              <span className="w-2 h-2 rounded-full bg-yellow-500"></span>
+                              {t.duplicate} — {t.duplicateOf} {f.duplicateOf}
+                            </div>
+                          )}
+
+                          {/* Error message */}
+                          {hasError && (
+                            <div className="mt-2 text-sm text-red-600 font-medium">
+                              {f.error}
+                            </div>
+                          )}
+                        </div>
+
+                        <button
+                          onClick={() => handleRemove(f.id)}
+                          className="flex-shrink-0 px-4 py-2 rounded-lg bg-red-50 hover:bg-red-100 text-red-700 font-semibold text-sm transition-colors"
+                        >
+                          {t.remove}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Total size footer */}
+              <div className="mt-3 text-right text-sm text-gray-500">
+                {language === 'bn' ? 'মোট:' : 'Total:'}{' '}
+                {formatBytes(pdfMeta.reduce((s, f) => s + (f.size || 0), 0))} /{' '}
+                {formatBytes(MAX_TOTAL_SIZE)}
+              </div>
             </div>
           )}
         </section>
