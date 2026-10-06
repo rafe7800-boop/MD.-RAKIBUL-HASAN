@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 
 // Configure PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc =
@@ -45,6 +46,16 @@ async function idbGetAll() {
     const tx = db.transaction(STORE_NAME, 'readonly');
     const req = tx.objectStore(STORE_NAME).getAll();
     req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbGet(id) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).get(id);
+    req.onsuccess = () => resolve(req.result || null);
     req.onerror = () => reject(req.error);
   });
 }
@@ -102,10 +113,23 @@ const isPdfFile = (file) => {
   return nameOk && (mimeOk || file.type === '' || file.type === 'application/octet-stream');
 };
 
-// Compare ISO date strings (YYYY-MM-DD). Returns -1/0/1
 function compareDates(a, b) {
   if (!a || !b) return 0;
   return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function todayISO() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// Latin-safe string for pdf-lib standard fonts (strip non-WinAnsi)
+function sanitizeForPdf(str) {
+  if (str == null) return '';
+  return String(str).replace(/[^\x00-\xFF]/g, '?');
 }
 
 // ---------- MT Logo ----------
@@ -132,13 +156,11 @@ const MTLogo = () => {
 
 // ---------- Main App ----------
 function App() {
-  // Language
   const [language, setLanguage] = useState(() => {
     const saved = localStorage.getItem('app_language');
     return saved === 'bn' ? 'bn' : 'en';
   });
 
-  // Tender data
   const [tenderData, setTenderData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -150,7 +172,7 @@ function App() {
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef(null);
 
-  // Matching state: { [requirementId]: fileId }
+  // Matching state
   const [matches, setMatches] = useState(() => {
     try {
       const saved = localStorage.getItem('requirement_matches');
@@ -160,7 +182,6 @@ function App() {
     }
   });
 
-  // Expiry dates: { [requirementId]: 'YYYY-MM-DD' }
   const [expiries, setExpiries] = useState(() => {
     try {
       const saved = localStorage.getItem('requirement_expiries');
@@ -169,6 +190,13 @@ function App() {
       return {};
     }
   });
+
+  // Generation state
+  const [generating, setGenerating] = useState(false);
+  const [generatedPdfUrl, setGeneratedPdfUrl] = useState(null);
+  const [generatedCsvUrl, setGeneratedCsvUrl] = useState(null);
+  const [generatedFileName, setGeneratedFileName] = useState('');
+  const [generationError, setGenerationError] = useState(null);
 
   // Persist language
   useEffect(() => {
@@ -257,7 +285,7 @@ function App() {
     };
   }, []);
 
-  // Recalculate duplicates whenever pdfMeta length changes
+  // Recalculate duplicates
   useEffect(() => {
     setPdfMeta((prev) => {
       const hashFirst = new Map();
@@ -444,7 +472,6 @@ function App() {
 
   const handleRemove = async (id) => {
     setPdfMeta((prev) => prev.filter((f) => f.id !== id));
-    // Also remove any match referencing this file
     setMatches((prev) => {
       const next = { ...prev };
       for (const reqId of Object.keys(next)) {
@@ -477,7 +504,6 @@ function App() {
       if (!fileId) {
         delete next[reqId];
       } else {
-        // Remove fileId from any other requirement
         for (const k of Object.keys(next)) {
           if (next[k] === fileId) delete next[k];
         }
@@ -504,27 +530,11 @@ function App() {
     setExpiries((prev) => ({ ...prev, [reqId]: value }));
   };
 
-  // Files currently matched (set of fileIds)
   const matchedFileIds = useMemo(() => {
     return new Set(Object.values(matches).filter(Boolean));
   }, [matches]);
 
-  // A file is "usable" only if it's not a duplicate AND has no read error
   const isFileUsable = (f) => !f.duplicateOf && !f.error;
-
-  // Check if a specific file can be assigned to a specific requirement
-  const canAssignFile = (reqId, fileId) => {
-    const file = pdfMeta.find((f) => f.id === fileId);
-    if (!file) return false;
-    if (!isFileUsable(file)) return false;
-    const currentMatch = matches[reqId];
-    if (currentMatch === fileId) return true;
-    // Check if already matched to another requirement
-    for (const k of Object.keys(matches)) {
-      if (k !== reqId && matches[k] === fileId) return false;
-    }
-    return true;
-  };
 
   // Compute status for each requirement
   const requirementStatuses = useMemo(() => {
@@ -543,13 +553,11 @@ function App() {
         continue;
       }
 
-      // File matched. Check if expiry date needed.
       if (req.has_expiry) {
         if (!expiry) {
           result[req.id] = { key: 'expiryNeeded', blocking: true };
           continue;
         }
-        // Expired if expiry < submission deadline
         const cmp = compareDates(expiry, SUBMISSION_DEADLINE);
         if (cmp < 0) {
           result[req.id] = { key: 'expired', blocking: true };
@@ -557,14 +565,12 @@ function App() {
         }
         result[req.id] = { key: 'ok', blocking: false };
       } else {
-        // No expiry needed
         result[req.id] = { key: 'ok', blocking: false };
       }
     }
     return result;
   }, [sortedRequirements, matches, pdfMeta, expiries]);
 
-  // Blocking list for generate button
   const blockingReasons = useMemo(() => {
     const list = [];
     for (const req of sortedRequirements) {
@@ -582,7 +588,7 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requirementStatuses, sortedRequirements, language]);
 
-  const canGenerate = blockingReasons.length === 0;
+  const canGenerate = blockingReasons.length === 0 && !generating;
 
   // ---------- Translations ----------
   const t = {
@@ -616,14 +622,19 @@ function App() {
     statusOk: language === 'bn' ? 'ঠিক আছে' : 'OK',
 
     blocking: language === 'bn' ? 'ব্লকিং' : 'blocking',
-    nonBlocking: language === 'bn' ? 'ব্লকিং নয়' : 'not blocking',
 
     generateBtn: language === 'bn' ? 'ডকুমেন্ট জেনারেট করুন' : 'Generate Document',
+    generating: language === 'bn' ? 'জেনারেট হচ্ছে...' : 'Generating...',
     cannotGenerate: language === 'bn' ? 'জেনারেট করা যাবে না' : 'Cannot generate',
     fixIssues: language === 'bn' ? 'নিচের সমস্যাগুলো ঠিক করুন:' : 'Fix the following issues:',
+
+    generatedTitle: language === 'bn' ? 'জেনারেট করা প্যাকেজ' : 'Generated Package',
+    preview: language === 'bn' ? 'প্রিভিউ' : 'Preview',
+    downloadPdf: language === 'bn' ? 'পিডিএফ ডাউনলোড করুন' : 'Download PDF',
+    downloadCsv: language === 'bn' ? 'CSV ডাউনলোড করুন' : 'Download CSV',
+    generationFailed: language === 'bn' ? 'জেনারেশন ব্যর্থ হয়েছে' : 'Generation failed',
   };
 
-  // Status label + colors
   const statusDisplay = (key) => {
     switch (key) {
       case 'missing':
@@ -647,304 +658,311 @@ function App() {
     }
   };
 
-  // ---------- Loading / Error ----------
-  if (loading) {
-    return (
-      <div className="min-h-screen bg-gray-100 flex items-center justify-center">
-        <div className="text-2xl text-gray-600 font-medium">Loading...</div>
-      </div>
-    );
-  }
+  // ---------- Generate Package ----------
+  const handleGenerate = async () => {
+    setGenerating(true);
+    setGenerationError(null);
+    setGeneratedPdfUrl(null);
+    setGeneratedCsvUrl(null);
 
-  if (error) {
-    return (
-      <div className="min-h-screen bg-gray-100 flex items-center justify-center p-4">
-        <div className="bg-white rounded-xl shadow-lg p-8 max-w-md text-center">
-          <div className="text-red-500 text-5xl mb-4">⚠️</div>
-          <h1 className="text-2xl font-bold text-gray-800 mb-2">Error Loading Data</h1>
-          <p className="text-gray-600">{error}</p>
-        </div>
-      </div>
-    );
-  }
+    try {
+      const { tender } = tenderData;
 
-  const { tender } = tenderData;
+      // Collect OK requirements with files (skip duplicates/non-OK)
+      const okItems = [];
+      for (const req of sortedRequirements) {
+        const st = requirementStatuses[req.id];
+        if (!st || st.key !== 'ok') continue;
+        const fileId = matches[req.id];
+        if (!fileId) continue;
+        const fileMeta = pdfMeta.find((f) => f.id === fileId);
+        if (!fileMeta) continue;
+        if (fileMeta.duplicateOf || fileMeta.error) continue;
+        okItems.push({ req, fileMeta });
+      }
 
-  return (
-    <div className="min-h-screen bg-gray-100">
-      {/* Header */}
-      <header className="bg-white shadow-md sticky top-0 z-10">
-        <div className="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <MTLogo />
-            <div>
-              <h1 className="text-xl font-bold text-gray-800 leading-tight">
-                {language === 'bn' ? 'এমটি টেন্ডার পোর্টাল' : 'MT Tender Portal'}
-              </h1>
-              <p className="text-sm text-gray-500">
-                {language === 'bn' ? 'দরপত্র ব্যবস্থাপনা' : 'Tender Management'}
-              </p>
-            </div>
-          </div>
+      // Console verification log
+      console.log('=== Tender Package Generation ===');
+      console.log('Tender ID:', tender.tender_id);
+      console.log('Total requirements:', sortedRequirements.length);
+      console.log('OK items to merge:', okItems.length);
+      sortedRequirements.forEach((req) => {
+        const fileId = matches[req.id];
+        const fileMeta = fileId ? pdfMeta.find((f) => f.id === fileId) : null;
+        const st = requirementStatuses[req.id];
+        console.log(
+          `[${req.order}] ${req.id} | File: ${fileMeta ? fileMeta.name : '(none)'} | Expiry: ${
+            expiries[req.id] || '(none)'
+          } | Status: ${st?.key || 'unknown'}`
+        );
+      });
 
-          <button
-            onClick={toggleLanguage}
-            className="px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold text-lg transition-colors shadow-sm"
-            aria-label="Toggle language"
-          >
-            EN | BN
-          </button>
-        </div>
-      </header>
+      // Create final PDF
+      const finalPdf = await PDFDocument.create();
+      const fontRegular = await finalPdf.embedFont(StandardFonts.Helvetica);
+      const fontBold = await finalPdf.embedFont(StandardFonts.HelveticaBold);
 
-      <main className="max-w-5xl mx-auto px-4 py-8">
-        {/* Tender Details */}
-        <section className="bg-white rounded-xl shadow-md p-6 mb-8 border-l-4 border-blue-600">
-          <div className="flex items-center gap-3 mb-4">
-            <span className="bg-blue-100 text-blue-800 text-sm font-bold px-3 py-1 rounded-full">
-              {tender.tender_id}
-            </span>
-            <span className="text-sm text-gray-500">
-              {language === 'bn' ? 'দরপত্র আইডি' : 'Tender ID'}
-            </span>
-          </div>
+      const pageWidth = 595.28; // A4
+      const pageHeight = 841.89;
+      const margin = 50;
 
-          <h2 className="text-2xl md:text-3xl font-bold text-gray-900 mb-4">
-            {language === 'bn' && tender.title_bn ? tender.title_bn : tender.title}
-          </h2>
+      // Try to embed logo
+      let logoImage = null;
+      try {
+        const logoRes = await fetch('/company_logo.png');
+        if (logoRes.ok) {
+          const logoBytes = await logoRes.arrayBuffer();
+          try {
+            logoImage = await finalPdf.embedPng(logoBytes);
+          } catch (e) {
+            try {
+              logoImage = await finalPdf.embedJpg(logoBytes);
+            } catch (e2) {
+              logoImage = null;
+            }
+          }
+        }
+      } catch (e) {
+        logoImage = null;
+      }
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="bg-gray-50 rounded-lg p-4">
-              <p className="text-sm text-gray-500 mb-1">
-                {language === 'bn' ? 'ক্রয়কারী প্রতিষ্ঠান' : 'Procuring Entity'}
-              </p>
-              <p className="text-lg font-semibold text-gray-800">
-                {language === 'bn' && tender.procuring_entity_bn
-                  ? tender.procuring_entity_bn
-                  : tender.procuring_entity}
-              </p>
-            </div>
+      // ---------- COVER PAGE ----------
+      const cover = finalPdf.addPage([pageWidth, pageHeight]);
+      let coverY = pageHeight - margin;
 
-            <div className="bg-gray-50 rounded-lg p-4">
-              <p className="text-sm text-gray-500 mb-1">
-                {language === 'bn' ? 'নিবেদনকারী' : 'Bidder'}
-              </p>
-              <p className="text-lg font-semibold text-gray-800">
-                {language === 'bn' && tender.bidder_bn ? tender.bidder_bn : tender.bidder}
-              </p>
-            </div>
+      // Logo
+      if (logoImage) {
+        const logoDim = logoImage.scale(0.5);
+        const maxLogoW = 100;
+        const maxLogoH = 100;
+        let lw = logoDim.width;
+        let lh = logoDim.height;
+        if (lw > maxLogoW) {
+          const r = maxLogoW / lw;
+          lw *= r;
+          lh *= r;
+        }
+        if (lh > maxLogoH) {
+          const r = maxLogoH / lh;
+          lw *= r;
+          lh *= r;
+        }
+        cover.drawImage(logoImage, {
+          x: (pageWidth - lw) / 2,
+          y: coverY - lh,
+          width: lw,
+          height: lh,
+        });
+        coverY -= lh + 24;
+      } else {
+        coverY -= 20;
+      }
 
-            <div className="bg-gray-50 rounded-lg p-4 md:col-span-2">
-              <p className="text-sm text-gray-500 mb-1">
-                {language === 'bn' ? 'জমা দেওয়ার শেষ তারিখ' : 'Submission Deadline'}
-              </p>
-              <p className="text-lg font-semibold text-red-600">
-                {formatDate(tender.submission_deadline)}
-              </p>
-            </div>
-          </div>
-        </section>
+      // Title
+      const coverTitle =
+        language === 'bn'
+          ? 'Tender Submission Package / টেন্ডার জমা প্যাকেজ'
+          : 'Tender Submission Package / টেন্ডার জমা প্যাকেজ';
+      // Draw title in two lines for reliability
+      cover.drawText(sanitizeForPdf('Tender Submission Package'), {
+        x: margin,
+        y: coverY,
+        size: 22,
+        font: fontBold,
+        color: rgb(0.1, 0.2, 0.5),
+      });
+      coverY -= 30;
+      cover.drawText(sanitizeForPdf('/ টেন্ডার জমা প্যাকেজ'), {
+        x: margin,
+        y: coverY,
+        size: 18,
+        font: fontBold,
+        color: rgb(0.1, 0.2, 0.5),
+      });
+      coverY -= 40;
 
-        {/* Requirements List */}
-        <section>
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-2xl font-bold text-gray-800">
-              {language === 'bn' ? 'শর্তাবলী' : 'Requirements'}
-            </h3>
-            <span className="bg-gray-200 text-gray-700 text-sm font-semibold px-3 py-1 rounded-full">
-              {sortedRequirements.length} {language === 'bn' ? 'টি' : 'items'}
-            </span>
-          </div>
+      // Divider
+      cover.drawLine({
+        start: { x: margin, y: coverY },
+        end: { x: pageWidth - margin, y: coverY },
+        thickness: 1,
+        color: rgb(0.7, 0.7, 0.7),
+      });
+      coverY -= 30;
 
-          {sortedRequirements.length === 0 ? (
-            <div className="bg-white rounded-xl shadow-md p-8 text-center text-gray-500 text-lg">
-              {language === 'bn' ? 'কোনো শর্ত পাওয়া যায়নি' : 'No requirements found'}
-            </div>
-          ) : (
-            <div className="space-y-4">
-              {sortedRequirements.map((req) => {
-                const st = requirementStatuses[req.id] || { key: 'notProvided', blocking: false };
-                const disp = statusDisplay(st.key);
-                const matchedFileId = matches[req.id] || '';
-                const expiry = expiries[req.id] || '';
+      // Details
+      const labelEn = (en, bn) => (language === 'bn' ? bn : en);
 
-                return (
-                  <div
-                    key={req.id}
-                    className={`bg-white rounded-xl shadow-md p-5 transition-shadow border-l-4 ${
-                      st.blocking
-                        ? st.key === 'expiryNeeded'
-                          ? 'border-orange-400'
-                          : 'border-red-500'
-                        : st.key === 'ok'
-                        ? 'border-green-500'
-                        : 'border-gray-300'
-                    }`}
-                  >
-                    <div className="flex flex-col sm:flex-row sm:items-start gap-3">
-                      <div className="flex-shrink-0">
-                        <div className="w-10 h-10 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-lg">
-                          {req.order}
-                        </div>
-                      </div>
+      const addField = (label, value) => {
+        cover.drawText(sanitizeForPdf(label), {
+          x: margin,
+          y: coverY,
+          size: 11,
+          font: fontBold,
+          color: rgb(0.35, 0.35, 0.35),
+        });
+        coverY -= 16;
+        // Wrap value
+        const maxWidth = pageWidth - margin * 2;
+        const valStr = sanitizeForPdf(value);
+        const words = valStr.split(' ');
+        let line = '';
+        const lines = [];
+        for (const w of words) {
+          const test = line ? line + ' ' + w : w;
+          const wWidth = fontRegular.widthOfTextAtSize(test, 14);
+          if (wWidth > maxWidth && line) {
+            lines.push(line);
+            line = w;
+          } else {
+            line = test;
+          }
+        }
+        if (line) lines.push(line);
+        for (const l of lines) {
+          cover.drawText(l, {
+            x: margin,
+            y: coverY,
+            size: 14,
+            font: fontRegular,
+            color: rgb(0.1, 0.1, 0.1),
+          });
+          coverY -= 18;
+        }
+        coverY -= 10;
+      };
 
-                      <div className="flex-1 min-w-0">
-                        <h4 className="text-xl font-semibold text-gray-900 mb-3">
-                          {getTitle(req)}
-                        </h4>
+      addField(labelEn('Tender ID', 'দরপত্র আইডি'), tender.tender_id);
+      addField(
+        labelEn('Title', 'শিরোনাম'),
+        language === 'bn' && tender.title_bn ? tender.title_bn : tender.title
+      );
+      addField(
+        labelEn('Procuring Entity', 'ক্রয়কারী প্রতিষ্ঠান'),
+        language === 'bn' && tender.procuring_entity_bn
+          ? tender.procuring_entity_bn
+          : tender.procuring_entity
+      );
+      addField(
+        labelEn('Bidder', 'নিবেদনকারী'),
+        language === 'bn' && tender.bidder_bn ? tender.bidder_bn : tender.bidder
+      );
+      addField(
+        labelEn('Submission Deadline', 'জমা দেওয়ার শেষ তারিখ'),
+        formatDate(tender.submission_deadline)
+      );
 
-                        <div className="flex flex-wrap gap-2 mb-3">
-                          <span
-                            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-semibold ${
-                              req.mandatory
-                                ? 'bg-red-100 text-red-800'
-                                : 'bg-green-100 text-green-800'
-                            }`}
-                          >
-                            <span
-                              className={`w-2 h-2 rounded-full ${
-                                req.mandatory ? 'bg-red-500' : 'bg-green-500'
-                              }`}
-                            ></span>
-                            {req.mandatory
-                              ? language === 'bn'
-                                ? 'বাধ্যতামূলক'
-                                : 'Mandatory'
-                              : language === 'bn'
-                              ? 'ঐচ্ছিক'
-                              : 'Optional'}
-                          </span>
+      const genTs = new Date().toLocaleString(language === 'bn' ? 'bn-BD' : 'en-GB');
+      addField(labelEn('Generated At', 'জেনারেট করা হয়েছে'), genTs);
 
-                          <span
-                            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-semibold ${
-                              req.has_expiry
-                                ? 'bg-amber-100 text-amber-800'
-                                : 'bg-gray-100 text-gray-600'
-                            }`}
-                          >
-                            <span
-                              className={`w-2 h-2 rounded-full ${
-                                req.has_expiry ? 'bg-amber-500' : 'bg-gray-400'
-                              }`}
-                            ></span>
-                            {req.has_expiry
-                              ? language === 'bn'
-                                ? 'মেয়াদ আছে'
-                                : 'Has Expiry'
-                              : language === 'bn'
-                              ? 'মেয়াদ নেই'
-                              : 'No Expiry'}
-                          </span>
+      // ---------- CHECKLIST PAGE ----------
+      const checklist = finalPdf.addPage([pageWidth, pageHeight]);
+      let y = pageHeight - margin;
 
-                          {/* Status badge */}
-                          <span
-                            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-bold border ${disp.cls}`}
-                          >
-                            {disp.label}
-                            {st.blocking && (
-                              <span className="text-xs font-semibold opacity-80">
-                                ({t.blocking})
-                              </span>
-                            )}
-                          </span>
-                        </div>
+      checklist.drawText(sanitizeForPdf('Verification Checklist / যাচাই চেকলিস্ট'), {
+        x: margin,
+        y,
+        size: 18,
+        font: fontBold,
+        color: rgb(0.1, 0.2, 0.5),
+      });
+      y -= 30;
 
-                        {/* Match controls */}
-                        <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
-                          <div>
-                            <label className="block text-sm font-semibold text-gray-600 mb-1">
-                              {t.matchWithFile}
-                            </label>
-                            <div className="flex gap-2">
-                              <select
-                                value={matchedFileId}
-                                onChange={(e) => handleMatchChange(req.id, e.target.value)}
-                                className="flex-1 min-w-0 px-3 py-2 rounded-lg border border-gray-300 bg-white text-gray-800 text-base focus:outline-none focus:ring-2 focus:ring-blue-500"
-                              >
-                                <option value="">{t.selectFilePlaceholder}</option>
-                                {pdfMeta.map((f) => {
-                                  const usable = isFileUsable(f);
-                                  // Show as disabled if: not usable OR matched to another req
-                                  const matchedElsewhere =
-                                    matchedFileIds.has(f.id) && matches[req.id] !== f.id;
-                                  const disabled = !usable || matchedElsewhere;
-                                  let suffix = '';
-                                  if (f.duplicateOf) suffix = ` (${t.duplicate})`;
-                                  else if (f.error) suffix = ` (${t.damaged})`;
-                                  return (
-                                    <option
-                                      key={f.id}
-                                      value={f.id}
-                                      disabled={disabled}
-                                    >
-                                      {f.name}
-                                      {suffix}
-                                    </option>
-                                  );
-                                })}
-                              </select>
+      // Column setup
+      const cols = [
+        { key: 'order', label: 'Order', width: 40 },
+        { key: 'id', label: 'Req ID', width: 70 },
+        { key: 'title', label: 'Title', width: 140 },
+        { key: 'mand', label: 'Mand.', width: 45 },
+        { key: 'exp', label: 'Expiry?', width: 50 },
+        { key: 'file', label: 'File', width: 110 },
+        { key: 'expDate', label: 'Expiry Date', width: 60 },
+        { key: 'status', label: 'Status', width: 60 },
+      ];
+      // Adjust widths to fit pageWidth - 2*margin
+      const totalW = cols.reduce((s, c) => s + c.width, 0);
+      const avail = pageWidth - margin * 2;
+      const scale = avail / totalW;
+      cols.forEach((c) => (c.width = c.width * scale));
 
-                              {matchedFileId && (
-                                <button
-                                  type="button"
-                                  onClick={() => handleClearMatch(req.id)}
-                                  className="px-3 py-2 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold text-sm transition-colors"
-                                >
-                                  {t.clear}
-                                </button>
-                              )}
-                            </div>
-                          </div>
+      const rowHeight = 22;
 
-                          {/* Expiry date input */}
-                          {req.has_expiry && matchedFileId && (
-                            <div>
-                              <label className="block text-sm font-semibold text-gray-600 mb-1">
-                                {t.expiryDate}
-                              </label>
-                              <input
-                                type="date"
-                                value={expiry}
-                                onChange={(e) => handleExpiryChange(req.id, e.target.value)}
-                                className="w-full px-3 py-2 rounded-lg border border-gray-300 bg-white text-gray-800 text-base focus:outline-none focus:ring-2 focus:ring-blue-500"
-                              />
-                            </div>
-                          )}
-                        </div>
-                      </div>
+      const drawTableHeader = () => {
+        let x = margin;
+        checklist.drawRectangle({
+          x: margin,
+          y: y - rowHeight,
+          width: avail,
+          height: rowHeight,
+          color: rgb(0.9, 0.93, 0.97),
+        });
+        cols.forEach((c) => {
+          checklist.drawText(sanitizeForPdf(c.label), {
+            x: x + 4,
+            y: y - rowHeight + 7,
+            size: 9,
+            font: fontBold,
+            color: rgb(0.15, 0.2, 0.35),
+          });
+          x += c.width;
+        });
+        y -= rowHeight;
+      };
 
-                      <div className="flex-shrink-0 self-start">
-                        <span className="text-xs text-gray-400 font-mono bg-gray-50 px-2 py-1 rounded">
-                          {req.id}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
+      drawTableHeader();
 
-        {/* ---------- PDF Upload Section ---------- */}
-        <section className="mt-10">
-          <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-            <div>
-              <h3 className="text-2xl font-bold text-gray-800">{t.pdfSectionTitle}</h3>
-              <p className="text-sm text-gray-500">{t.pdfSectionSubtitle}</p>
-            </div>
-            {pdfMeta.length > 0 && (
-              <button
-                onClick={handleClearAll}
-                className="px-4 py-2 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold text-sm transition-colors"
-              >
-                {t.clearAll}
-              </button>
-            )}
-          </div>
+      const statusColor = (key) => {
+        switch (key) {
+          case 'ok':
+            return rgb(0.1, 0.5, 0.2);
+          case 'expired':
+          case 'missing':
+            return rgb(0.7, 0.1, 0.1);
+          case 'expiryNeeded':
+            return rgb(0.8, 0.45, 0.0);
+          default:
+            return rgb(0.4, 0.4, 0.4);
+        }
+      };
 
-          {uploadError && (
-            <div className="mb-4 bg-red-50 border-l-4 border-red-500 rounded-lg p-4 flex items-start gap-3">
-              <span className="text-red-500 text-xl">⚠️</span>
-              <p className="text-red-700 font-medium flex-1">{uploadError}</p>
-             
+      const statusLabelShort = (key) => {
+        switch (key) {
+          case 'ok':
+            return 'OK';
+          case 'expired':
+            return language === 'bn' ? 'মেয়াদোত্তীর্ণ' : 'Expired';
+          case 'missing':
+            return language === 'bn' ? 'অনুপস্থিত' : 'Missing';
+          case 'expiryNeeded':
+            return language === 'bn' ? 'মেয়াদ প্রয়োজন' : 'Expiry needed';
+          case 'notProvided':
+            return language === 'bn' ? 'প্রদান করা হয়নি' : 'Not provided';
+          default:
+            return key;
+        }
+      };
+
+      let okCount = 0;
+
+      for (const req of sortedRequirements) {
+        if (y - rowHeight < margin + 40) {
+          // new page
+          const p = finalPdf.addPage([pageWidth, pageHeight]);
+          y = pageHeight - margin;
+          // re-draw header on new page
+          // Note: we need to reassign drawing to new page
+          // Simpler: draw using `p`
+          let xh = margin;
+          p.drawRectangle({
+            x: margin,
+            y: y - rowHeight,
+            width: avail,
+            height: rowHeight,
+            color: rgb(0.9, 0.93, 0.97),
+          });
+          cols.forEach((c) => {
+            p.drawText(sanitizeForPdf(c.label), {
+              x: xh + 4,
+              y: y - rowHeight + 7,
+              size: 9,
+              font:
