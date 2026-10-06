@@ -948,6 +948,31 @@ function App() {
           ? tender.procuring_entity_bn
           : tender.procuring_entity
       );
-      addField(
-        labelEn('Bidder', 'নিবেদনকারী'),
-        language === 'bn' && tender.bidder_bn ? tender.bid
+     addField(
+  labelEn('Bidder', 'নিবেদনকারী'),
+  language === 'bn' && tender.bidder_bn ? tender.bidder_bn : tender.bidder
+);
+
+addField(
+  labelEn('Value', 'মূল্য'),
+  tender.value ? `${tender.value}` : 'N/A'
+);
+
+addField(
+  labelEn('Date', 'তারিখ'),
+  tender.date || new Date().toLocaleDateString()
+);
+
+    coverY -= 10;
+    const pdfBytes = await pdfDoc.save();
+    return pdfBytes;
+  };
+
+  // ... rest of your component ...
+
+  return (
+    // your JSX
+  );
+}
+
+export default App;
